@@ -61,7 +61,7 @@ def pil_to_b64(img):
     return base64.b64encode(buf.getvalue()).decode()
 
 # =========================
-# HANDLER
+# HANDLER ###
 # =========================
 
 def handler(job):
