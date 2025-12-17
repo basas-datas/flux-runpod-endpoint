@@ -1,7 +1,15 @@
 import os
 import io
 import base64
+import types
 import torch
+
+# =========================
+# FIX для diffusers + torch
+# =========================
+if not hasattr(torch, "xpu"):
+    torch.xpu = types.SimpleNamespace(empty_cache=lambda: None)
+
 import runpod
 from PIL import Image
 from diffusers import FluxKontextPipeline
@@ -21,13 +29,13 @@ DEVICE = "cuda"
 # ЗАГРУЗКА МОДЕЛИ (1 РАЗ)
 # =========================
 
-print("Loading FLUX Kontext base model...")
+print("Loading FLUX Kontext base model...", flush=True)
 pipe = FluxKontextPipeline.from_pretrained(
     BASE_MODEL,
     torch_dtype=DTYPE
 ).to(DEVICE)
 
-print("Loading LoRA...")
+print("Loading LoRA...", flush=True)
 pipe.load_lora_weights(
     LORA_REPO,
     weight_name=LORA_FILE,
@@ -37,7 +45,7 @@ pipe.load_lora_weights(
 pipe.set_adapters(["watermark_remover"], adapter_weights=[1.0])
 pipe.enable_model_cpu_offload = False
 
-print("Model ready.")
+print("Model ready.", flush=True)
 
 # =========================
 # UTILS
@@ -57,6 +65,8 @@ def pil_to_b64(img):
 # =========================
 
 def handler(job):
+    print("JOB RECEIVED", flush=True)
+
     inp = job["input"]
 
     image_b64 = inp["image_base64"]
