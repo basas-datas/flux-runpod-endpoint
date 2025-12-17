@@ -6,14 +6,41 @@ import torch
 
 # =========================
 # FIX для diffusers + torch
-# Исправляет AttributeError: 'types.SimpleNamespace' object has no attribute 'device_count'
+# diffusers может обращаться к torch.xpu.* при импорте,
+# а в некоторых сборках torch (CUDA-only) torch.xpu отсутствует.
 # =========================
+
+def _noop(*args, **kwargs):
+    return None
+
+def _zero(*args, **kwargs):
+    return 0
+
+def _false(*args, **kwargs):
+    return False
+
+# Создаём torch.xpu, если его нет
 if not hasattr(torch, "xpu"):
-    torch.xpu = types.SimpleNamespace(
-        empty_cache=lambda: None,
-        device_count=lambda: 0,
-        is_available=lambda: False
-    )
+    torch.xpu = types.SimpleNamespace()
+
+# Докидываем ожидаемые атрибуты, если их нет
+if not hasattr(torch.xpu, "empty_cache"):
+    torch.xpu.empty_cache = _noop
+if not hasattr(torch.xpu, "device_count"):
+    torch.xpu.device_count = _zero
+if not hasattr(torch.xpu, "is_available"):
+    torch.xpu.is_available = _false
+if not hasattr(torch.xpu, "current_device"):
+    torch.xpu.current_device = _zero
+if not hasattr(torch.xpu, "synchronize"):
+    torch.xpu.synchronize = _noop
+
+# (опционально) небольшие оптимизации матмулов на NVIDIA
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 import runpod
 from PIL import Image
@@ -35,13 +62,14 @@ DEVICE = "cuda"
 # =========================
 
 print("Loading FLUX Kontext base model...", flush=True)
-# Используем device_map="auto" или явный .to(DEVICE)
+
 pipe = FluxKontextPipeline.from_pretrained(
     BASE_MODEL,
     torch_dtype=DTYPE
 ).to(DEVICE)
 
 print("Loading LoRA...", flush=True)
+
 pipe.load_lora_weights(
     LORA_REPO,
     weight_name=LORA_FILE,
@@ -49,7 +77,12 @@ pipe.load_lora_weights(
 )
 
 pipe.set_adapters(["watermark_remover"], adapter_weights=[1.0])
-pipe.enable_model_cpu_offload = False
+
+# отключаем прогресс-бар (чуть меньше мусора в логах)
+try:
+    pipe.set_progress_bar_config(disable=True)
+except Exception:
+    pass
 
 print("Model ready.", flush=True)
 
@@ -57,14 +90,18 @@ print("Model ready.", flush=True)
 # UTILS
 # =========================
 
-def b64_to_pil(b64):
-    data = base64.b64decode(b64)
+def b64_to_pil(b64_str: str) -> Image.Image:
+    # поддержка data-url вида: data:image/png;base64,....
+    if "," in b64_str and b64_str.strip().lower().startswith("data:"):
+        b64_str = b64_str.split(",", 1)[1]
+
+    data = base64.b64decode(b64_str)
     return Image.open(io.BytesIO(data)).convert("RGB")
 
-def pil_to_b64(img):
+def pil_to_b64_png(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # =========================
 # HANDLER
@@ -74,7 +111,6 @@ def handler(job):
     print("JOB RECEIVED", flush=True)
 
     inp = job.get("input", {})
-
     if "image_base64" not in inp:
         return {"error": "Missing 'image_base64' in input"}
 
@@ -88,14 +124,11 @@ def handler(job):
     steps = int(inp.get("steps", 28))
     seed = int(inp.get("seed", 42))
 
-    try:
-        image = b64_to_pil(image_b64)
-        
-        # Генератор для воспроизводимости
-        generator = torch.Generator(device=DEVICE).manual_seed(seed)
+    image = b64_to_pil(image_b64)
 
-        print(f"Running inference with prompt: {prompt}", flush=True)
-        
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    with torch.inference_mode():
         result = pipe(
             image=image,
             prompt=prompt,
@@ -106,12 +139,6 @@ def handler(job):
             generator=generator,
         ).images[0]
 
-        return {
-            "image_base64": pil_to_b64(result)
-        }
-    except Exception as e:
-        print(f"Error during inference: {str(e)}", flush=True)
-        return {"error": str(e)}
+    return {"image_base64": pil_to_b64_png(result)}
 
-# Запуск сервера
 runpod.serverless.start({"handler": handler})
