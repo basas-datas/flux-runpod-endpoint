@@ -104,7 +104,7 @@ def pil_to_b64_png(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # =========================
-# HANDLER
+# HANDLERefsdfsdfdf
 # =========================
 
 def handler(job):
