@@ -1,8 +1,10 @@
 runpod
-torch
 diffusers
 transformers
 accelerate
 safetensors
 huggingface_hub
 pillow
+sentencepiece
+peft
+torchvision
