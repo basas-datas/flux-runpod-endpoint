@@ -1,0 +1,10 @@
+torch
+diffusers
+transformers
+accelerate
+huggingface_hub
+sentencepiece
+peft
+torchvision
+pillow
+runpod

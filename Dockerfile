@@ -1,21 +1,19 @@
-# Используем стабильный образ от RunPod или NVIDIA
-FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# Установка зависимостей
-RUN pip3 install --upgrade pip
-RUN pip3 install diffusers==0.30.2 \
-    transformers==4.44.0 \
-    accelerate==0.33.0 \
-    sentencepiece \
-    runpod \
-    huggingface_hub \
-    peft
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
-# Предзагрузка модели, чтобы не качать её при каждом запуске
-RUN python3 -c "from diffusers import FluxKontextPipeline; import torch; \
-    FluxKontextPipeline.from_pretrained('black-forest-labs/FLUX.1-Kontext-dev', torch_dtype=torch.bfloat16)"
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY handler.py .
 
-CMD ["python3", "-u", "handler.py"]
+COPY requirements.txt .
+RUN pip3 install --upgrade pip && pip3 install --no-cache-dir -r requirements.txt
+
+COPY rp_handler.py .
+
+CMD ["python3", "-u", "rp_handler.py"]
