@@ -2,6 +2,7 @@ import base64
 import io
 import runpod
 import torch
+import os
 from PIL import Image
 from diffusers import FluxKontextPipeline
 
@@ -9,11 +10,14 @@ from diffusers import FluxKontextPipeline
 # ИНИЦИАЛИЗАЦИЯ (выполняется 1 раз)
 # ----------------------------
 
+HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 pipe = FluxKontextPipeline.from_pretrained(
     "black-forest-labs/FLUX.1-Kontext-dev",
     torch_dtype=torch.bfloat16,
+    token=HF_TOKEN,
 ).to(DEVICE)
 
 pipe.load_lora_weights(
