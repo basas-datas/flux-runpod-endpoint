@@ -33,9 +33,8 @@ os.makedirs(TRANSFORMERS_CACHE, exist_ok=True)
 HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_SIDE = 1568          # max размер стороны
+MAX_SIDE = 1568
 MAX_SEED = 2**31 - 1
-PAD_MULTIPLE = 16        # кратность сторон
 
 if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
     DTYPE = torch.bfloat16
@@ -56,10 +55,6 @@ pipe = FluxKontextPipeline.from_pretrained(
     torch_dtype=DTYPE,
     token=HF_TOKEN,
 ).to(DEVICE)
-
-# при необходимости — подключай свои LoRA здесь
-# pipe.load_lora_weights(...)
-# pipe.set_adapters(...)
 
 try:
     pipe.vae.to(dtype=torch.float32)
@@ -116,26 +111,6 @@ def resize_max_side(img: Image.Image, max_side: int = 1568) -> Image.Image:
         return img.resize((new_w, new_h), Image.LANCZOS)
     return img
 
-def pad_to_multiple_edge(img: Image.Image, multiple: int = 16) -> Image.Image:
-    """
-    Pad до кратности multiple по правому и нижнему краю.
-    Обратного кропа НЕТ.
-    """
-    w, h = img.size
-    pad_w = (multiple - (w % multiple)) % multiple
-    pad_h = (multiple - (h % multiple)) % multiple
-
-    if pad_w == 0 and pad_h == 0:
-        return img
-
-    arr = np.array(img, dtype=np.uint8)
-    arr_padded = np.pad(
-        arr,
-        pad_width=((0, pad_h), (0, pad_w), (0, 0)),
-        mode="edge",
-    )
-    return Image.fromarray(arr_padded, mode="RGB")
-
 def pil_to_base64_png_rgb(img: Image.Image) -> str:
     img = img.convert("RGB")
     buf = io.BytesIO()
@@ -152,24 +127,21 @@ def handler(job):
     if "image" not in job_input:
         return {"error": "image (base64) is required"}
 
-    prompt = job_input.get("prompt", "[photo content], clear picture from overlays")
+    prompt = job_input.get(
+        "prompt",
+        "[photo content], remove overlays and reconstruct background naturally"
+    )
     guidance_scale = float(job_input.get("guidance_scale", 2.5))
     steps = int(job_input.get("steps", 28))
 
     seed = int(job_input.get("seed", 42))
-    randomize_seed = bool(job_input.get("randomize_seed", False))
-    if randomize_seed:
+    if job_input.get("randomize_seed"):
         seed = random.randint(0, MAX_SEED)
 
     # ---- Load & normalize image ----
     img = base64_to_pil(job_input["image"])
     img = remove_alpha_force_rgb(img)
-
-    # max сторона 1568px
     img = resize_max_side(img, MAX_SIDE)
-
-    # pad до кратности 16 (без обратного кропа)
-    img = pad_to_multiple_edge(img, PAD_MULTIPLE)
 
     generator = None
     if DEVICE == "cuda":
@@ -210,5 +182,5 @@ def handler(job):
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Starting FLUX Kontext Serverless Worker")
+    print("Starting FLUX Kontext Serverless Worker (NO PADDING)")
     runpod.serverless.start({"handler": handler})
