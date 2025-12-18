@@ -33,18 +33,15 @@ os.makedirs(TRANSFORMERS_CACHE, exist_ok=True)
 HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_SIDE = 1024
+MAX_SIDE = 1568          # max размер стороны
 MAX_SEED = 2**31 - 1
-PAD_MULTIPLE = 16  # padding to multiple-of-16 then crop back
+PAD_MULTIPLE = 16        # кратность сторон
 
-# Prefer BF16 on CUDA if supported, else fallback
 if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
     DTYPE = torch.bfloat16
 else:
-    # CPU -> float32; CUDA without bf16 -> float16
     DTYPE = torch.float32 if DEVICE == "cpu" else torch.float16
 
-# Optional: helps performance/stability on Ampere+
 if DEVICE == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -60,15 +57,10 @@ pipe = FluxKontextPipeline.from_pretrained(
     token=HF_TOKEN,
 ).to(DEVICE)
 
-pipe.load_lora_weights(
-    "prithivMLmods/Kontext-Watermark-Remover",
-    weight_name="Kontext-Watermark-Remover.safetensors",
-    adapter_name="watermark_remover",
-)
-pipe.set_adapters(["watermark_remover"], adapter_weights=[1.0])
+# при необходимости — подключай свои LoRA здесь
+# pipe.load_lora_weights(...)
+# pipe.set_adapters(...)
 
-# If you want extra robustness, you can keep VAE in fp32:
-# (sometimes reduces NaNs/black outputs)
 try:
     pipe.vae.to(dtype=torch.float32)
 except Exception:
@@ -79,22 +71,15 @@ except Exception:
 # ------------------------------------------------------------------
 
 def base64_to_pil(base64_str: str) -> Image.Image:
-    # supports data URLs like "data:image/png;base64,...."
     if "," in base64_str:
         base64_str = base64_str.split(",", 1)[1]
     raw = base64.b64decode(base64_str)
     img = Image.open(io.BytesIO(raw))
-    img = ImageOps.exif_transpose(img)  # respect EXIF orientation
+    img = ImageOps.exif_transpose(img)
     img.load()
     return img
 
 def remove_alpha_force_rgb(img: Image.Image) -> Image.Image:
-    """
-    Ensures output is RGB (no alpha). If input has transparency,
-    composite over a background color estimated from border pixels;
-    fallback to white.
-    """
-    # Normalize palette images with transparency etc.
     if img.mode in ("P", "LA"):
         img = img.convert("RGBA")
 
@@ -103,7 +88,6 @@ def remove_alpha_force_rgb(img: Image.Image) -> Image.Image:
         rgb = arr[..., :3].astype(np.float32)
         a = arr[..., 3].astype(np.float32) / 255.0
 
-        # estimate background from border pixels where alpha is present
         h, w = a.shape
         border = np.zeros((h, w), dtype=bool)
         border[0, :] = True
@@ -121,10 +105,9 @@ def remove_alpha_force_rgb(img: Image.Image) -> Image.Image:
         out = np.clip(comp, 0, 255).astype(np.uint8)
         return Image.fromarray(out, mode="RGB")
 
-    # CMYK / L / etc -> RGB
     return img.convert("RGB")
 
-def resize_long_side(img: Image.Image, max_side: int = 1024) -> Image.Image:
+def resize_max_side(img: Image.Image, max_side: int = 1568) -> Image.Image:
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
     if scale < 1.0:
@@ -133,38 +116,34 @@ def resize_long_side(img: Image.Image, max_side: int = 1024) -> Image.Image:
         return img.resize((new_w, new_h), Image.LANCZOS)
     return img
 
-def pad_to_multiple_edge(img: Image.Image, multiple: int = 16):
+def pad_to_multiple_edge(img: Image.Image, multiple: int = 16) -> Image.Image:
     """
-    Pads RGB image to (H,W) multiples using edge replication.
-    Returns padded_image, crop_box_to_restore (left, top, right, bottom)
+    Pad до кратности multiple по правому и нижнему краю.
+    Обратного кропа НЕТ.
     """
     w, h = img.size
     pad_w = (multiple - (w % multiple)) % multiple
     pad_h = (multiple - (h % multiple)) % multiple
 
     if pad_w == 0 and pad_h == 0:
-        return img, (0, 0, w, h)
+        return img
 
     arr = np.array(img, dtype=np.uint8)
-    # pad right and bottom with edge values
     arr_padded = np.pad(
         arr,
         pad_width=((0, pad_h), (0, pad_w), (0, 0)),
         mode="edge",
     )
-    padded = Image.fromarray(arr_padded, mode="RGB")
-    # crop box to restore original resized dims
-    return padded, (0, 0, w, h)
+    return Image.fromarray(arr_padded, mode="RGB")
 
 def pil_to_base64_png_rgb(img: Image.Image) -> str:
-    # ensure no alpha in output
     img = img.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # ------------------------------------------------------------------
-# HANDLERfdf
+# HANDLER
 # ------------------------------------------------------------------
 
 def handler(job):
@@ -173,11 +152,7 @@ def handler(job):
     if "image" not in job_input:
         return {"error": "image (base64) is required"}
 
-    prompt = job_input.get(
-        "prompt",
-        "[photo content], remove any watermark, text or logos"
-    )
-
+    prompt = job_input.get("prompt", "[photo content], clear picture from overlays")
     guidance_scale = float(job_input.get("guidance_scale", 2.5))
     steps = int(job_input.get("steps", 28))
 
@@ -186,26 +161,27 @@ def handler(job):
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
 
-    # ---- Load & normalize image (any format) ----
+    # ---- Load & normalize image ----
     img = base64_to_pil(job_input["image"])
-    img = remove_alpha_force_rgb(img)        # обязательное удаление alpha
-    img = resize_long_side(img, MAX_SIDE)    # сохранить пропорцию, max side <= 1024
+    img = remove_alpha_force_rgb(img)
 
-    # Pad to stable sizes (multiple-of-16), then crop back after
-    img_padded, crop_box = pad_to_multiple_edge(img, PAD_MULTIPLE)
+    # max сторона 1568px
+    img = resize_max_side(img, MAX_SIDE)
+
+    # pad до кратности 16 (без обратного кропа)
+    img = pad_to_multiple_edge(img, PAD_MULTIPLE)
 
     generator = None
     if DEVICE == "cuda":
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-    # ---- Inference (lock for thread safety) ----
+    # ---- Inference ----
     with PIPE_LOCK:
         if DEVICE == "cuda" and DTYPE == torch.bfloat16:
             autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
         elif DEVICE == "cuda" and DTYPE == torch.float16:
             autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
         else:
-            # CPU: no autocast
             class _Noop:
                 def __enter__(self): return None
                 def __exit__(self, *args): return False
@@ -213,19 +189,15 @@ def handler(job):
 
         with torch.inference_mode(), autocast_ctx:
             out = pipe(
-                image=img_padded,
+                image=img,
                 prompt=prompt,
                 guidance_scale=guidance_scale,
                 num_inference_steps=steps,
-                width=img_padded.width,
-                height=img_padded.height,
+                width=img.width,
+                height=img.height,
                 generator=generator,
             ).images[0]
 
-    # Crop back to resized original dims (preserve proportion)
-    out = out.crop(crop_box)
-
-    # Ensure RGB output (no alpha) and PNG base64
     return {
         "image": pil_to_base64_png_rgb(out),
         "seed": seed,
@@ -238,5 +210,5 @@ def handler(job):
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Starting FLUX Kontext Serverless Worker (bf16 preferred)")
+    print("Starting FLUX Kontext Serverless Worker")
     runpod.serverless.start({"handler": handler})
