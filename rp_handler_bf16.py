@@ -9,11 +9,11 @@ import torch
 import numpy as np
 from PIL import Image, ImageOps
 from diffusers import FluxKontextPipeline
-from transformers import T5EncoderModel, BitsAndBytesConfig
 
 # ------------------------------------------------------------------
 # STORAGE CONFIG
 # ------------------------------------------------------------------
+
 HF_HOME = "/runpod-volume/hf"
 HF_HUB_CACHE = f"{HF_HOME}/hub"
 TRANSFORMERS_CACHE = f"{HF_HOME}/transformers"
@@ -21,7 +21,7 @@ TRANSFORMERS_CACHE = f"{HF_HOME}/transformers"
 os.environ["HF_HOME"] = HF_HOME
 os.environ["HF_HUB_CACHE"] = HF_HUB_CACHE
 os.environ["TRANSFORMERS_CACHE"] = TRANSFORMERS_CACHE
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1" # Ускоряем загрузку
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 os.makedirs(HF_HUB_CACHE, exist_ok=True)
 os.makedirs(TRANSFORMERS_CACHE, exist_ok=True)
@@ -29,42 +29,42 @@ os.makedirs(TRANSFORMERS_CACHE, exist_ok=True)
 # ------------------------------------------------------------------
 # MODEL CONFIG
 # ------------------------------------------------------------------
+
 HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_SIDE = 1568
 MAX_SEED = 2**31 - 1
+
+if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
+    DTYPE = torch.bfloat16
+else:
+    DTYPE = torch.float32 if DEVICE == "cpu" else torch.float16
+
+if DEVICE == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+
 PIPE_LOCK = Lock()
 
 # ------------------------------------------------------------------
-# MODEL INIT (OPTIMIZED FOR 24GB)
+# MODEL INIT
 # ------------------------------------------------------------------
 
-print("Loading FLUX Kontext with FP8 optimizations...")
-
-# Настройка квантования для T5 и основной модели
-quant_config = BitsAndBytesConfig(load_in_8bit=True)
-
-# Загружаем пайплайн
-# Использование bfloat16 для основных вычислений + CPU offload
 pipe = FluxKontextPipeline.from_pretrained(
     "black-forest-labs/FLUX.1-Kontext-dev",
-    torch_dtype=torch.bfloat16,
+    torch_dtype=DTYPE,
     token=HF_TOKEN,
-)
+).to(DEVICE)
 
-# Оптимизации памяти:
-# 1. Переносим модель на CPU и загружаем в GPU только нужные блоки по очереди
-pipe.enable_model_cpu_offload()
-
-# 2. Декодируем VAE по частям (спасает от OOM на больших картинках)
-pipe.enable_vae_slicing()
-
-# 3. (Опционально) Если все еще тесно, можно включить перенос весов T5
-# pipe.text_encoder_2.to(dtype=torch.float8_e4m3fn) 
+try:
+    pipe.vae.to(dtype=torch.float32)
+except Exception:
+    pass
 
 # ------------------------------------------------------------------
 # IMAGE HELPERS
 # ------------------------------------------------------------------
+
 def base64_to_pil(base64_str: str) -> Image.Image:
     if "," in base64_str:
         base64_str = base64_str.split(",", 1)[1]
@@ -77,24 +77,29 @@ def base64_to_pil(base64_str: str) -> Image.Image:
 def remove_alpha_force_rgb(img: Image.Image) -> Image.Image:
     if img.mode in ("P", "LA"):
         img = img.convert("RGBA")
+
     if img.mode == "RGBA":
         arr = np.array(img, dtype=np.uint8)
         rgb = arr[..., :3].astype(np.float32)
         a = arr[..., 3].astype(np.float32) / 255.0
+
         h, w = a.shape
         border = np.zeros((h, w), dtype=bool)
         border[0, :] = True
         border[-1, :] = True
         border[:, 0] = True
         border[:, -1] = True
+
         mask = border & (a > 0.1)
         if mask.any():
             bg = np.median(rgb[mask], axis=0)
         else:
             bg = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+
         comp = rgb * a[..., None] + bg[None, None, :] * (1.0 - a[..., None])
         out = np.clip(comp, 0, 255).astype(np.uint8)
         return Image.fromarray(out, mode="RGB")
+
     return img.convert("RGB")
 
 def resize_max_side(img: Image.Image, max_side: int = 1568) -> Image.Image:
@@ -115,6 +120,7 @@ def pil_to_base64_png_rgb(img: Image.Image) -> str:
 # ------------------------------------------------------------------
 # HANDLER
 # ------------------------------------------------------------------
+
 def handler(job):
     job_input = job.get("input", {})
 
@@ -127,8 +133,8 @@ def handler(job):
     )
     guidance_scale = float(job_input.get("guidance_scale", 2.5))
     steps = int(job_input.get("steps", 28))
+
     seed = int(job_input.get("seed", 42))
-    
     if job_input.get("randomize_seed"):
         seed = random.randint(0, MAX_SEED)
 
@@ -137,13 +143,23 @@ def handler(job):
     img = remove_alpha_force_rgb(img)
     img = resize_max_side(img, MAX_SIDE)
 
-    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+    generator = None
+    if DEVICE == "cuda":
+        generator = torch.Generator(device="cuda").manual_seed(seed)
 
     # ---- Inference ----
     with PIPE_LOCK:
-        with torch.inference_mode():
-            # Мы не используем autocast вручную, так как enable_model_cpu_offload 
-            # сам управляет типами данных и устройствами
+        if DEVICE == "cuda" and DTYPE == torch.bfloat16:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+        elif DEVICE == "cuda" and DTYPE == torch.float16:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+        else:
+            class _Noop:
+                def __enter__(self): return None
+                def __exit__(self, *args): return False
+            autocast_ctx = _Noop()
+
+        with torch.inference_mode(), autocast_ctx:
             out = pipe(
                 image=img,
                 prompt=prompt,
@@ -164,6 +180,7 @@ def handler(job):
 # ------------------------------------------------------------------
 # START SERVERLESS
 # ------------------------------------------------------------------
+
 if __name__ == "__main__":
-    print("Starting Optimized FLUX Kontext Serverless Worker")
+    print("Starting FLUX Kontext Serverless Worker (NO PADDING)")
     runpod.serverless.start({"handler": handler})
