@@ -164,7 +164,7 @@ def pil_to_base64_png_rgb(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # ------------------------------------------------------------------
-# HANDLER
+# HANDLERfdf
 # ------------------------------------------------------------------
 
 def handler(job):
