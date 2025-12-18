@@ -7,4 +7,5 @@ sentencepiece
 peft
 torchvision
 pillow
+protobuf
 runpod
