@@ -8,7 +8,7 @@ from PIL import Image
 from diffusers import FluxKontextPipeline
 
 # ------------------------------------------------------------------
-# STORAGE CONFIG (КАК В COMFYUI)
+# STORAGE CONFIG
 # ------------------------------------------------------------------
 
 HF_HOME = "/runpod-volume/hf"
@@ -34,7 +34,7 @@ MAX_SIDE = 1024
 MAX_SEED = 2**31 - 1
 
 # ------------------------------------------------------------------
-# MODEL INIT (ONCE PER WORKER)
+# MODEL INIT
 # ------------------------------------------------------------------
 
 pipe = FluxKontextPipeline.from_pretrained(
@@ -94,7 +94,6 @@ def handler(job):
 
     guidance_scale = float(job_input.get("guidance_scale", 2.5))
     steps = int(job_input.get("steps", 28))
-    strength = float(job_input.get("strength", 0.6))
 
     seed = job_input.get("seed", 42)
     randomize_seed = bool(job_input.get("randomize_seed", False))
@@ -114,7 +113,6 @@ def handler(job):
         result = pipe(
             image=image,
             prompt=prompt,
-            strength=strength,
             guidance_scale=guidance_scale,
             num_inference_steps=steps,
             width=image.width,
